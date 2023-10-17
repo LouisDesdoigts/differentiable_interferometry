@@ -84,7 +84,8 @@ def pairwise_vectors(points):
 
 # def hex_from_bls(coords, bl, rmax):
 def hex_from_bls(bl, coords, rmax):
-    coords = dlu.translate_coords(coords, np.array([-bl[0], bl[1]]))
+    # coords = dlu.translate_coords(coords, np.array([-bl[0], bl[1]]))
+    coords = dlu.translate_coords(coords, np.array(bl))
     return dlu.reg_polygon(coords, rmax, 6)
 
 
@@ -201,7 +202,7 @@ class UVSource(dl.BaseSource):
     wavelengths: jax.Array
     weights: jax.Array
     position: jax.Array  # arcsec
-    flux: float
+    flux: jax.Array
     mask: jax.Array
     amplitudes: jax.Array
     phases: jax.Array
@@ -235,15 +236,13 @@ class UVSource(dl.BaseSource):
 
         # Set up position and flux
         self.position = np.asarray(position, float)
-        self.flux = float(flux)
+        self.flux = np.array(flux)
         if self.position.shape != (2,):
             raise ValueError(
                 f"Position must be a 2-element array, not {self.position.shape}"
             )
 
-        # Build the Mask
         self.pad = int(pad)
-
         self.mask = mask
 
         # Construct amplitudes and phases
@@ -260,11 +259,8 @@ class UVSource(dl.BaseSource):
     # TODO: Rename apply visibilites, take splodge and inv from self
     def _apply_splodge(self, psf, splodge, inv_splodge_support):
         cplx = self._to_uv(psf)
-
         splodged_cplx = cplx * splodge
-
         inv_splodge_cplx = cplx * inv_splodge_support
-
         return self._from_uv(splodged_cplx + inv_splodge_cplx)
 
     @property
@@ -272,7 +268,12 @@ class UVSource(dl.BaseSource):
         return self.amplitudes * np.exp(1j * self.phases)
 
     def normalise(self):
-        return self.divide("weights", self.weights.sum())
+        norm_weights = self.weights / self.weights.sum()
+        norm_phases = self.phases - self.phases[0]
+        return self.set(["weights", "phases"], [norm_weights, norm_phases])
+        # norm_aml = self.amplitudes - (1 - self.dc)
+        # return self.set(["weights", "amplitudes"], [norm_weights, norm_aml])
+        # return self.divide("weights", self.weights.sum())
 
     @property
     def N(self):
@@ -283,6 +284,7 @@ class UVSource(dl.BaseSource):
         # Get the components of the calculation
         mask = self.mask[:, : self.N]
         conj_mask = self.mask[:, self.N : -1]
+        # dc = self.dc * self.mask[:, -1]
         dc = self.mask[:, -1]
         vis = self.visibilities
 
