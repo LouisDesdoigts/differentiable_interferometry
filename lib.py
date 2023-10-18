@@ -149,9 +149,8 @@ def uv_hex_mask(
     uv_hexes_conj = np.array(uv_hexes_conj)
 
     dc_hex = np.array([hex_from_bls([0, 0], uv_coords, rmax_in)])
-    # hexes = np.array(uv_hexes)
 
-    hexes = np.concatenate([uv_hexes, uv_hexes_conj, dc_hex])
+    hexes = np.concatenate([dc_hex, uv_hexes, uv_hexes_conj])
 
     # Normalise
     norm_hexes = dlu.nandiv(hexes, hexes.sum(0), 0.0)
@@ -174,7 +173,6 @@ def compare_mask(cplx, masks, pad):
 
     logged = np.where(np.log10(ampl) == -np.inf, np.nan, np.log10(ampl))
     vmin, vmax = np.nanmin(logged), np.nanmax(logged)
-    # print(vmin, vmax)
 
     # plt.figure(figsize=(20, 8))
     plt.figure(figsize=(10, 4))
@@ -247,8 +245,8 @@ class UVSource(dl.BaseSource):
 
         # Construct amplitudes and phases
         N = (self.mask.shape[1] - 1) // 2  # Should always be even after -1
-        self.amplitudes = np.ones(N)
-        self.phases = np.zeros(N)
+        self.amplitudes = np.ones(N + 1)  # +1 for dc term
+        self.phases = np.zeros(N + 1)  # +1 for dc term
 
     def _to_uv(self, psf):
         return np.fft.fftshift(np.fft.fft2(np.fft.fftshift(psf)))
@@ -270,30 +268,29 @@ class UVSource(dl.BaseSource):
     def normalise(self):
         norm_weights = self.weights / self.weights.sum()
         norm_phases = self.phases - self.phases[0]
-        return self.set(["weights", "phases"], [norm_weights, norm_phases])
-        # norm_aml = self.amplitudes - (1 - self.dc)
-        # return self.set(["weights", "amplitudes"], [norm_weights, norm_aml])
-        # return self.divide("weights", self.weights.sum())
+        norm_ampls = 1 + self.amplitudes - self.amplitudes[0]
+        return self.set(
+            ["weights", "phases", "amplitudes"], [norm_weights, norm_phases, norm_ampls]
+        )
 
     @property
     def N(self):
-        return len(self.amplitudes)
+        return len(self.amplitudes) - 1  # -1 for dc term
 
     @property
     def splodges(self):
         # Get the components of the calculation
-        mask = self.mask[:, : self.N]
-        conj_mask = self.mask[:, self.N : -1]
-        # dc = self.dc * self.mask[:, -1]
-        dc = self.mask[:, -1]
+        dc_mask = self.mask[:, 0]
+        mask = self.mask[:, 1 : self.N + 1]
+        conj_mask = self.mask[:, -self.N :]
         vis = self.visibilities
 
         # Get the splodges
         dot = lambda a, b: dlu.eval_basis(a, b)
-        splodge_fn = (
-            lambda mask, conj_mask, dc: dot(mask, vis) + dot(conj_mask, vis.conj()) + dc
+        splodge_fn = lambda dc_mask, mask, conj_mask: (
+            dc_mask * vis[0] + dot(mask, vis[1:]) + dot(conj_mask, vis[1:].conj())
         )
-        return vmap(splodge_fn)(mask, conj_mask, dc)
+        return vmap(splodge_fn)(dc_mask, mask, conj_mask)
 
     @property
     def inv_splodges_support(self):
