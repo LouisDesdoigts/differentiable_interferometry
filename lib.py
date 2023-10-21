@@ -249,9 +249,11 @@ class UVSource(dl.BaseSource):
         self.mask = mask
 
         # Construct amplitudes and phases
-        N = (self.mask.shape[1] - 1) // 2  # Should always be even after -1
-        self.amplitudes = np.ones(N + 1)  # +1 for dc term
-        self.phases = np.zeros(N + 1)  # +1 for dc term
+        N = (self.mask.shape[1] - 1) // 2  # Should always be even after -1, because DC
+        # self.amplitudes = np.ones(N + 1)  # +1 for dc term
+        # self.phases = np.zeros(N + 1)  # +1 for dc term
+        self.amplitudes = np.ones(N)
+        self.phases = np.zeros(N)
 
     def _to_uv(self, psf):
         return np.fft.fftshift(np.fft.fft2(np.fft.fftshift(psf)))
@@ -271,19 +273,21 @@ class UVSource(dl.BaseSource):
         return self.amplitudes * np.exp(1j * self.phases)
 
     def normalise(self):
-        norm_weights = self.weights / self.weights.sum()
+        return self.divide("weights", self.weights.sum())
+        # norm_weights = self.weights / self.weights.sum()
         # norm_phases = self.phases - self.phases[0]
-        norm_phases = self.phases
+        # norm_phases = self.phases
         # norm_ampls = 1 + self.amplitudes - self.amplitudes[0]
         # norm_ampls = self.amplitudes / self.amplitudes[0]
-        norm_ampls = self.amplitudes
-        return self.set(
-            ["weights", "phases", "amplitudes"], [norm_weights, norm_phases, norm_ampls]
-        )
+        # norm_ampls = self.amplitudes
+        # return self.set(
+        # ["weights", "phases", "amplitudes"], [norm_weights, norm_phases, norm_ampls]
+        # )
 
     @property
     def N(self):
-        return len(self.amplitudes) - 1  # -1 for dc term
+        # return len(self.amplitudes) - 1  # -1 for dc term
+        return len(self.amplitudes)
 
     @property
     def splodges(self):
@@ -296,7 +300,10 @@ class UVSource(dl.BaseSource):
         # Get the splodges
         dot = lambda a, b: dlu.eval_basis(a, b)
         splodge_fn = lambda dc_mask, mask, conj_mask: (
-            dc_mask * vis[0] + dot(mask, vis[1:]) + dot(conj_mask, vis[1:].conj())
+            # dc_mask * vis[0] + dot(mask, vis[1:]) + dot(conj_mask, vis[1:].conj())
+            dc_mask
+            + dot(mask, vis)
+            + dot(conj_mask, vis.conj())
         )
         return vmap(splodge_fn)(dc_mask, mask, conj_mask)
 
@@ -708,19 +715,25 @@ def get_AMI_splodge_mask(tel, wavelengths, calc_pad=2, pad=2, verbose=True):
     return np.array(masks)
 
 
-def get_nan_support(file, n_mask=1, order=1):
+def get_nan_support(file, n_mask=1, order=1, thresh=None):
     # Get the data we need
     im = np.array(file[1].data).astype(float)
     dq = np.array(file[3].data).astype(bool)
 
     # Get the high flux mask
-    sorted = np.sort(im.flatten())
-    thresh = sorted[~np.isnan(sorted)][-n_mask]
-    flux_mask = convert_adjacent_to_true(im >= thresh)
-    if order > 1:
-        for i in range(order - 1):
-            flux_mask = convert_adjacent_to_true(flux_mask)
-    im = im.at[np.where(flux_mask)].set(np.nan)
+    if n_mask > 0:
+        sorted = np.sort(im.flatten())
+        thresh_in = sorted[~np.isnan(sorted)][-n_mask]
+
+        if thresh is not None:
+            thresh_in = np.minimum(thresh, thresh_in)
+        # im = im.at[np.where(im < thresh_in)].set(np.nan)
+
+        flux_mask = convert_adjacent_to_true(im >= thresh_in)
+        if order > 1:
+            for i in range(order - 1):
+                flux_mask = convert_adjacent_to_true(flux_mask)
+        im = im.at[np.where(flux_mask)].set(np.nan)
 
     # Build the mask
     support_mask = ~np.isnan(im) & ~dq
@@ -795,7 +808,7 @@ def plot_vis(holes, model, fim):
 
     hbls = pairwise_vectors(holes)
     bls_r = np.array(np.hypot(hbls[:, 0], hbls[:, 1]))
-    bls_r = np.concatenate([np.zeros(1), bls_r])  # Add DC term
+    # bls_r = np.concatenate([np.zeros(1), bls_r])  # Add DC term
 
     plt.figure(figsize=(14, 5))
 
