@@ -356,6 +356,92 @@ class UVSource(dl.BaseSource):
         return np.abs(cplx_psfs).sum(0)
 
 
+from jax.scipy.ndimage import map_coordinates
+
+
+def arr2pix(coords, pscale=1):
+    n = coords.shape[-1]
+    shift = (n - 1) / 2
+    return pscale * (coords - shift)
+
+
+def pix2arr(coords, pscale=1):
+    n = coords.shape[-1]
+    shift = (n - 1) / 2
+    return (coords / pscale) + shift
+
+
+class Interpolator(dl.layers.unified_layers.UnifiedLayer):
+    transform: dl.CoordTransform
+    order: int
+    layer: None
+
+    def __init__(self, layer, transform, order=1):
+        self.transform = transform
+        self.layer = layer
+        self.order = int(order)
+
+    # def __getattribute__(self, name):
+    #     output = super().__getattribute__(name)
+    #     if self._check(output):
+    #         print("getattribute")
+    #         return self.interpolate(output)
+    #     return output
+
+    def __getattr__(self, key):
+        if hasattr(self.layer, key):
+            # output = getattr(self.layer, key)
+            # if self._check(output):
+            #     print("getattr")
+            #     return self.interpolate(output)
+            # else:
+            #     return output
+            return getattr(self.layer, key)
+        elif hasattr(self.transform, key):
+            return getattr(self.transform, key)
+        else:
+            raise AttributeError(f"Interpolator has no attribute {key}")
+
+    def _check(self, item):
+        if (
+            isinstance(item, jax.Array)  # Array check
+            and item.ndim == 2  # 2D check
+            and item.shape[0] == item.shape[1]  # Square check
+        ):
+            return True
+        return False
+
+    def orig_coords(self, arr):
+        # Generate paraxial coords with pixel scale of 1
+        return dlu.pixel_coords(arr.shape[0], arr.shape[0])
+
+    def interp_coords(self, arr):
+        # Apply the transformation
+        return self.transform.apply(self.orig_coords(arr))
+
+    def pix_coords(self, arr):
+        # Convert from pixel to array coords
+        coords = pix2arr(self.interp_coords(arr))
+
+        # indexing convention swap: (x, y) -> (i, j)
+        return np.array([coords[1], coords[0]])
+
+    def interpolate(self, arr):
+        return map_coordinates(arr, self.pix_coords(arr), 1)
+
+    @property
+    def transformed(self):
+        fn = lambda leaf: self.interpolate(leaf) if self._check(leaf) else leaf
+        return jax.tree_util.tree_map(fn, self.layer)
+
+    def apply(self, wavefront):
+        return self.transformed.apply(wavefront)
+
+
+# tf = dl.CoordTransform((0.0, 0.0), 0.0, (1.0, 1.0), (0.0, 0.0))
+# _tel = tel.set("pupil_mask", Interpolator(tel.pupil_mask, tf))
+
+
 import scipy
 import numpy as onp
 
@@ -866,7 +952,10 @@ def show_splodges(model, s=65, pupil_phases=False, k=0.5):
 
     if pupil_phases:
         seismic.set_bad("k", k)
-        transmisson = np.flipud(model.pupil_mask.transmission)
+        if hasattr(model.pupil_mask, "transformed"):
+            transmisson = np.flipud(model.pupil_mask.transformed.transmission)
+        else:
+            transmisson = np.flipud(model.pupil_mask.transmission)
         opd = (model.basis_opd * 1e9).at[np.where(~(transmisson > 1e-6))].set(np.nan)
         v = np.nanmax(np.abs(opd))
         plt.subplot(1, n, 3)
