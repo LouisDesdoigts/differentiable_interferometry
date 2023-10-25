@@ -8,6 +8,213 @@ from jax.scipy.signal import convolve
 from matplotlib import colormaps
 from jax import vmap
 
+import optax
+
+
+# TODO: Add an optional 'norm_fn' that normalises the model as desired
+# Maybe a process_grads fn too for fixing params?
+def fit_image(
+    # tel,
+    model,
+    data,
+    err,
+    # file,
+    loss_fn,
+    grad_fn,
+    norm_fn,
+    epochs,
+    config,
+    loss_scale=1e-4,
+    verbose=True,
+    print_grads=False,
+):
+    params = list(config.keys())
+    optimisers = [config[param]["optim"] for param in params]
+
+    model = zdx.set_array(model, params)
+    optim, opt_state = zdx.get_optimiser(model, params, optimisers)
+
+    if verbose:
+        print("Compiling...")
+    loss, grads = loss_fn(model, data, err)
+    if print_grads:
+        for param in params:
+            print(f"{param}: {grads.get(param)}")
+    losses, models_out = [], [model]
+
+    if verbose:
+        looper = tqdm(range(epochs), desc="Loss %.2f" % (loss * loss_scale))
+    else:
+        looper = range(epochs)
+
+    for i in looper:
+        # calculate the loss and gradient
+        new_loss, grads = loss_fn(model, data, err)
+
+        if new_loss > loss:
+            print(
+                f"Loss increased from {loss * loss_scale:.2f} to "
+                f"{new_loss * loss_scale:.2f} on {i} th epoch"
+            )
+        loss = new_loss
+        if np.isnan(loss):
+            print(f"Loss is NaN on {i} th epoch")
+            return losses, models_out
+
+        # Apply any processing to the gradients
+        grads = grad_fn(grads, config, i)
+
+        # apply the update
+        updates, opt_state = optim.update(grads, opt_state)
+        model = zdx.apply_updates(model, updates)
+
+        # Apply normalisation
+        model = norm_fn(model)
+
+        # save results
+        models_out.append(model)
+        losses.append(loss)
+
+        if verbose:
+            looper.set_description("Loss %.2f" % (loss * loss_scale))
+
+    return losses, models_out
+
+
+def planck(wav, T):
+    h = 6.626e-34
+    c = 3.0e8
+    k = 1.38e-23
+    a = 2.0 * h * c**2
+    b = h * c / (wav * k * T)
+    intensity = a / ((wav**5) * (np.exp(b) - 1.0))
+    return intensity
+
+
+### Sub-propagations ###
+def transfer(coords, npixels, wavelength, pscale, distance):
+    """
+    The optical transfer function (OTF) for the gaussian beam.
+    Assumes propagation is along the axis.
+    """
+    scaling = npixels * pscale**2
+    rho_sq = ((coords / scaling) ** 2).sum(0)
+    return np.exp(-1.0j * np.pi * wavelength * distance * rho_sq)
+
+
+def _fft(phasor):
+    return 1 / phasor.shape[0] * np.fft.fft2(phasor)
+
+
+def _ifft(phasor):
+    return phasor.shape[0] * np.fft.ifft2(phasor)
+
+
+def plane_to_plane(wf, distance):
+    tf = transfer(wf.coordinates, wf.npixels, wf.wavelength, wf.pixel_scale, distance)
+    phasor = _fft(wf.phasor)
+    phasor *= np.fft.fftshift(tf)
+    phasor = _ifft(phasor)
+    return phasor
+
+
+class FreeSpace(dl.layers.optics.OpticalLayer):
+    distance: jax.Array
+
+    def __init__(self, dist):
+        self.distance = np.asarray(dist, float)
+
+    def apply(self, wf):
+        phasor_out = plane_to_plane(wf, self.distance)
+        return wf.set(
+            ["amplitude", "phase"], [np.abs(phasor_out), np.angle(phasor_out)]
+        )
+
+
+class PupilAmplitudes(dl.layers.optics.OpticalLayer):
+    basis: jax.Array
+    coefficients: jax.Array
+
+    def __init__(self, basis, coefficients=None):
+        self.basis = np.asarray(basis, float)
+
+        if coefficients is None:
+            self.coefficients = np.zeros(basis.shape[:-2])
+        else:
+            self.coefficients = np.asarray(coefficients, float)
+
+    def normalise(self):
+        # Normalise to mean of 1
+        return self.add("coefficients", self.coefficients.mean())
+
+    def apply(self, wavefront):
+        self = self.normalise()
+        amplitudes = 1 + dlu.eval_basis(self.basis, self.coefficients)
+        return wavefront.multiply("amplitude", amplitudes)
+
+
+from typing import List, Any
+
+
+class FresnelOptics(dl.CartesianOpticalSystem):
+    """
+    fl = pixel_scale_m / pixel_scale_rad -> NIRISS pixel scales are 18um  and
+    0.0656 arcsec respectively, so fl ~= 56.6m
+    """
+
+    defocus: jax.Array  # metres, is this actually um??
+
+    def __init__(self, *args, **kwargs):
+        self.defocus = np.array(0.0)
+        super().__init__(*args, **kwargs)
+
+    def propagate_mono(
+        self: dl.optical_systems.OpticalSystem,
+        wavelength: jax.Array,
+        offset: jax.Array = np.zeros(2),
+        return_wf: bool = False,
+    ) -> jax.Array:
+        """
+        Propagates a monochromatic point source through the optical layers.
+
+        Parameters
+        ----------
+        wavelength : float, metres
+            The wavelength of the wavefront to propagate through the optical layers.
+        offset : Array, radians = np.zeros(2)
+            The (x, y) offset from the optical axis of the source.
+        return_wf: bool = False
+            Should the Wavefront object be returned instead of the psf Array?
+
+        Returns
+        -------
+        object : Array, Wavefront
+            if `return_wf` is False, returns the psf Array.
+            if `return_wf` is True, returns the Wavefront object.
+        """
+        # Unintuitive syntax here, this is saying call the _parent class_ of
+        # CartesianOpticalSystem, ie LayeredOpticalSystem, which is what we want.
+        wf = super(dl.optical_systems.CartesianOpticalSystem, self).propagate_mono(
+            wavelength, offset, return_wf=True
+        )
+
+        # Propagate
+        true_pixel_scale = self.psf_pixel_scale / self.oversample
+        pixel_scale = 1e-6 * true_pixel_scale
+        psf_npixels = self.psf_npixels * self.oversample
+
+        wf = wf.propagate_fresnel(
+            psf_npixels,
+            pixel_scale,
+            self.focal_length,
+            focal_shift=self.defocus,
+        )
+
+        # Return PSF or Wavefront
+        if return_wf:
+            return wf
+        return wf.psf
+
 
 from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
@@ -554,17 +761,17 @@ def binary_vis2(u, v, wavel, sep, pa, flux_ratio=1, baseline=None):
 def summarise_files(files, extra_keys=[]):
     main_keys = [
         "TARGPROP",
-        "TARGNAME",
+        # "TARGNAME",
         "FILTER",
         "OBSERVTN",
         "PATTTYPE",
-        "APERNAME",
-        "PUPIL",
-        "SUBARRAY",
-        "DETECTOR",
-        "DATAMODL",
-        "INSTRUME",
-        "EXP_TYPE",
+        # "APERNAME",
+        # "PUPIL",
+        # "SUBARRAY",
+        # "DETECTOR",
+        # "DATAMODL",
+        # "INSTRUME",
+        # "EXP_TYPE",
     ]
 
     main_keys += extra_keys
@@ -609,6 +816,221 @@ def get_files(data_path, ext, **kwargs):
             if match:
                 files.append(file)
     return files
+
+
+def get_webb_osys_fits(file):
+    import webbpsf
+    import datetime
+
+    inst = getattr(webbpsf, file[0].header["INSTRUME"])()
+
+    # Set filter
+    inst.filter = file[0].header["FILTER"]
+
+    # Set aperture
+    inst.aperturename = file[0].header["APERNAME"]
+
+    # Set pupil mask
+    if file[0].header["PUPIL"] == "NRM":
+        pupil_in = "MASK_NRM"
+    else:
+        pupil_in = file[0].header["PUPIL"]
+    inst.pupil_mask = pupil_in
+
+    # Set WFS data
+    d1 = datetime.datetime.fromisoformat(file[0].header["DATE-BEG"])
+    d2 = datetime.datetime.fromisoformat(file[0].header["DATE-END"])
+
+    # Weirdness here because you cant add datetimes
+    time = (d1 + (d2 - d1) / 2).isoformat()
+
+    # Load WFS data
+    print("Loading WFS data")
+    inst.load_wss_opd_by_date(time, verbose=False)
+
+    # Calculate data to ensure things are populated correctly
+    psf_fits = inst.calc_psf()
+
+    return inst, psf_fits
+
+
+def initialise_for_data(tel, file):
+    psf_npix, pos, flux = get_intial_values(tel, file)
+    return tel.set(["psf_npixels", "position", "flux"], [psf_npix, pos, flux])
+
+
+def get_intial_values(tel, file):
+    # Enforce correct npix
+    im = np.array(file[1].data).astype(float)
+    im = im.at[np.where(np.isnan(im))].set(0.0)
+
+    # Get naive model
+    tel = tel.set("psf_npixels", im.shape[0])
+    tel = tel.set("position", np.zeros(2))
+    tel = tel.set("flux", im.sum())
+    psf = tel.model()
+
+    # Get position
+    conv = convolve(im, psf, mode="same")
+
+    max_idx = np.array(np.where(conv == conv.max())).squeeze()
+    parax_pix_pos = max_idx - im.shape[0] // 2
+
+    if not isinstance(tel.optics, (dl.AngularOpticalSystem, dl.CartesianOpticalSystem)):
+        optics = tel.optics.optics
+    else:
+        optics = tel.optics
+
+    if isinstance(optics, dl.CartesianOpticalSystem):
+        pscale = dlu.rad2arcsec(1e-6 * optics.psf_pixel_scale / optics.focal_length)
+    elif isinstance(optics, dl.AngularOpticalSystem):
+        pscale = optics.psf_pixel_scale
+    else:
+        raise ValueError("Optics must be Cartesian or Angular")
+    pos = np.roll(pscale * parax_pix_pos, 1)
+    pos *= np.array([1, -1])
+
+    # Get flux
+    ratio = im.sum() / psf.sum()
+    flux = ratio * im.sum()
+
+    return im.shape[0], pos, flux
+
+
+def get_AMI_splodge_mask(tel, wavelengths, calc_pad=2, pad=2, verbose=True, f2f=0.82):
+    from nrm_analysis.misctools import mask_definitions
+
+    # Take holes from ImPlaneIA
+    holes = mask_definitions.jwst_g7s6c()[1]
+    # f2f = 0.82  # m
+
+    # Get values from telescope
+    oversample = tel.oversample
+    psf_npix = tel.psf_npixels
+    pscale = tel.psf_pixel_scale
+
+    if verbose:
+        looper = tqdm(wavelengths)
+    else:
+        looper = wavelengths
+
+    # Now we calculate the masks
+    masks = []
+    for wl in looper:
+        masks.append(
+            uv_hex_mask(holes, f2f, wl, pscale, psf_npix, oversample, pad, calc_pad)
+        )
+
+    return np.array(masks)
+
+
+def convert_adjacent_to_true(bool_array):
+    trues = np.array(np.where(bool_array))
+    trues = np.swapaxes(trues, 0, 1)
+    for i in range(len(trues)):
+        y, x = trues[i]
+        bool_array = bool_array.at[y, x + 1].set(True)
+        bool_array = bool_array.at[y, x - 1].set(True)
+        bool_array = bool_array.at[y + 1, x].set(True)
+        bool_array = bool_array.at[y - 1, x].set(True)
+    return bool_array
+
+
+def nan_brightest(array, n_mask, order=1, thresh=None):
+    # Get the high flux mask
+    if n_mask > 0:
+        sorted = np.sort(array.flatten())
+        thresh_in = sorted[~np.isnan(sorted)][-n_mask]
+
+        if thresh is not None:
+            thresh_in = np.minimum(thresh, thresh_in)
+
+        flux_mask = convert_adjacent_to_true(array >= thresh_in)
+        if order > 1:
+            for i in range(order - 1):
+                flux_mask = convert_adjacent_to_true(flux_mask)
+        return array.at[np.where(flux_mask)].set(np.nan)
+
+
+def get_nan_support(file, n_mask=1, order=1, thresh=None):
+    # Get the data we need
+    im = np.array(file[1].data).astype(float)
+    dq = np.array(file[3].data).astype(bool)
+
+    im = nan_brightest(im, n_mask, order, thresh)
+    return ~np.isnan(im) & ~dq
+
+
+# def gettr(im, support):
+#     return im[support[0], support[1]]
+
+
+# def like_fn(model, data, sigma, sup):
+#     return jsp.stats.norm.pdf(
+#         gettr(model.model(), sup), loc=gettr(data, sup), scale=gettr(sigma, sup)
+#     )
+
+
+# def loglike_fn(model, data, sigma, sup):
+#     return jsp.stats.norm.logpdf(
+#         gettr(model.model(), sup), loc=gettr(data, sup), scale=gettr(sigma, sup)
+#     )
+#     # return jsp.stats.norm.logpdf(model.model(), loc=data, scale=sigma)
+
+
+def get_likelihoods(psf, data, err):
+    return (
+        jsp.stats.norm.pdf(psf, loc=data, scale=err),
+        -jsp.stats.norm.logpdf(psf, loc=data, scale=err),
+    )
+
+
+# def show_likelihoods(model, file, show_res=True, n_mask=1, order=1, k=0.5):
+#     im = np.array(file[1].data).astype(float)
+#     err = np.array(file[2].data).astype(float)
+#     support, support_mask = get_nan_support(file, n_mask=n_mask, order=order)
+
+#     like_px = like_fn(model, im, err, support)  # pixel likelihood 1d
+#     loglike_px = -loglike_fn(model, im, err, support)  # pixel likelihood, 1d
+
+#     like_im = np.ones_like(im) * np.nan
+#     like_im = like_im.at[support[0], support[1]].set(like_px)
+#     loglike_im = like_im.at[support[0], support[1]].set(loglike_px)
+
+#     return like_im, loglike_im, support_mask
+
+# return like_im, loglike_im
+
+# if show_res:
+#     psf = model.model().at[~support_mask].set(np.nan)
+#     data = im.at[~support_mask].set(np.nan)
+#     res = data - psf
+#     n = 3
+# else:
+#     n = 2
+
+# inferno.set_bad("k", k)
+# plt.figure(figsize=(n * 5, 4))
+# plt.subplot(1, n, 1)
+# plt.title("Pixel likelihood")
+# plt.imshow(like_im, cmap=inferno)
+# plt.colorbar()
+
+# plt.subplot(1, n, 2)
+# plt.title("Pixel neg log likelihood")
+# plt.imshow(loglike_im, cmap=inferno)
+# plt.colorbar()
+
+# if show_res:
+#     seismic.set_bad("k", k)
+#     v = np.nanmax(np.abs(res))
+#     plt.subplot(1, n, 3)
+#     plt.title("Residual")
+#     plt.imshow(res, cmap=seismic, vmin=-v, vmax=v)
+#     plt.colorbar()
+
+# plt.tight_layout()
+# plt.show()
 
 
 def plot_image(fits_file, idx=0):
@@ -680,235 +1102,40 @@ def compare(arr1, arr2, cut=0, normres=True, titles=["arr1", "arr2"], k=0.5):
     plt.show()
 
 
-def convert_adjacent_to_true(bool_array):
-    trues = np.array(np.where(bool_array))
-    trues = np.swapaxes(trues, 0, 1)
-    for i in range(len(trues)):
-        y, x = trues[i]
-        bool_array = bool_array.at[y, x + 1].set(True)
-        bool_array = bool_array.at[y, x - 1].set(True)
-        bool_array = bool_array.at[y + 1, x].set(True)
-        bool_array = bool_array.at[y - 1, x].set(True)
-    return bool_array
-
-
-def get_webb_osys_fits(file):
-    import webbpsf
-    import datetime
-
-    inst = getattr(webbpsf, file[0].header["INSTRUME"])()
-
-    # Set filter
-    inst.filter = file[0].header["FILTER"]
-
-    # Set aperture
-    inst.aperturename = file[0].header["APERNAME"]
-
-    # Set pupil mask
-    if file[0].header["PUPIL"] == "NRM":
-        pupil_in = "MASK_NRM"
-    else:
-        pupil_in = file[0].header["PUPIL"]
-    inst.pupil_mask = pupil_in
-
-    # Set WFS data
-    d1 = datetime.datetime.fromisoformat(file[0].header["DATE-BEG"])
-    d2 = datetime.datetime.fromisoformat(file[0].header["DATE-END"])
-
-    # Weirdness here because you cant add datetimes
-    time = (d1 + (d2 - d1) / 2).isoformat()
-
-    # Load WFS data
-    print("Loading WFS data")
-    inst.load_wss_opd_by_date(time, verbose=False)
-
-    # Calculate data to ensure things are populated correctly
-    psf_fits = inst.calc_psf()
-
-    return inst, psf_fits
-
-
-def initialise_for_data(tel, file):
-    psf_npix, pos, flux = get_intial_values(tel, file)
-    return tel.set(["psf_npixels", "position", "flux"], [psf_npix, pos, flux])
-
-
-def get_intial_values(tel, file):
-    # Enforce correct npix
-    im = np.array(file[1].data).astype(float)
-    im = im.at[np.where(np.isnan(im))].set(0.0)
-
-    # Get naive model
-    tel = tel.set("psf_npixels", im.shape[0])
-    tel = tel.set("position", np.zeros(2))
-    tel = tel.set("flux", im.sum())
-    psf = tel.model()
-
-    # Get position
-    conv = convolve(im, psf, mode="same")
-
-    max_idx = np.array(np.where(conv == conv.max())).squeeze()
-    parax_pix_pos = max_idx - im.shape[0] // 2
-    # print(parax_pix_pos)
-    # plt.imshow(conv)
-    # plt.scatter(max_idx[1], max_idx[0])
-    # plt.show()
-    pos = np.roll(tel.psf_pixel_scale * parax_pix_pos, 1)
-    pos *= np.array([1, -1])
-
-    # print(pos)
-
-    # Get flux
-    ratio = im.sum() / psf.sum()
-    flux = ratio * im.sum()
-
-    # # Enforce initial position
-    # max_idx = np.array(np.where(im == np.nanmax(im))).squeeze()
-    # pos = np.roll(tel.psf_pixel_scale * (max_idx - im.shape[0] // 2), 1)
-
-    # pos = dlu.rad2arcsec(pos)
-    # Enforce initial flux
-    # ratio = 1 / tel.set("flux", 1.0).model().max()
-    # flux_estimate = np.nansum(im) * 6.5 # 6.5 is a hack factor, might break on some ob
-
-    return im.shape[0], pos, flux
-
-
-def get_AMI_splodge_mask(tel, wavelengths, calc_pad=2, pad=2, verbose=True):
-    from nrm_analysis.misctools import mask_definitions
-
-    # Take holes from ImPlaneIA
-    holes = mask_definitions.jwst_g7s6c()[1]
-    f2f = 0.82  # m
-
-    # Get values from telescope
-    oversample = tel.oversample
-    psf_npix = tel.psf_npixels
-    pscale = tel.psf_pixel_scale
-
-    if verbose:
-        looper = tqdm(wavelengths)
-    else:
-        looper = wavelengths
-
-    # Now we calculate the masks
-    masks = []
-    for wl in looper:
-        masks.append(
-            uv_hex_mask(holes, f2f, wl, pscale, psf_npix, oversample, pad, calc_pad)
-        )
-
-    return np.array(masks)
-
-
-def get_nan_support(file, n_mask=1, order=1, thresh=None):
-    # Get the data we need
-    im = np.array(file[1].data).astype(float)
-    dq = np.array(file[3].data).astype(bool)
-
-    # Get the high flux mask
-    if n_mask > 0:
-        sorted = np.sort(im.flatten())
-        thresh_in = sorted[~np.isnan(sorted)][-n_mask]
-
-        if thresh is not None:
-            thresh_in = np.minimum(thresh, thresh_in)
-        # im = im.at[np.where(im < thresh_in)].set(np.nan)
-
-        flux_mask = convert_adjacent_to_true(im >= thresh_in)
-        if order > 1:
-            for i in range(order - 1):
-                flux_mask = convert_adjacent_to_true(flux_mask)
-        im = im.at[np.where(flux_mask)].set(np.nan)
-
-    # Build the mask
-    support_mask = ~np.isnan(im) & ~dq
-    support = np.array(np.where(support_mask))
-
-    return support, support_mask
-
-
-def gettr(im, support):
-    return im[support[0], support[1]]
-
-
-def like_fn(model, data, sigma, sup):
-    return jsp.stats.norm.pdf(
-        gettr(model.model(), sup), loc=gettr(data, sup), scale=gettr(sigma, sup)
-    )
-
-
-def loglike_fn(model, data, sigma, sup):
-    return jsp.stats.norm.logpdf(
-        gettr(model.model(), sup), loc=gettr(data, sup), scale=gettr(sigma, sup)
-    )
-
-
-def show_likelihoods(model, file, show_res=True, n_mask=1, order=1, k=0.5):
-    im = np.array(file[1].data).astype(float)
-    err = np.array(file[2].data).astype(float)
-    support, support_mask = get_nan_support(file, n_mask=n_mask, order=order)
-
-    like_px = like_fn(model, im, err, support)  # pixel likelihood 1d
-    loglike_px = -loglike_fn(model, im, err, support)  # pixel likelihood, 1d
-
-    like_im = np.ones_like(im) * np.nan
-    like_im = like_im.at[support[0], support[1]].set(like_px)
-    loglike_im = like_im.at[support[0], support[1]].set(loglike_px)
-
-    if show_res:
-        psf = model.model().at[~support_mask].set(np.nan)
-        data = im.at[~support_mask].set(np.nan)
-        res = data - psf
-        n = 3
-    else:
-        n = 2
-
-    inferno.set_bad("k", k)
-    plt.figure(figsize=(n * 5, 4))
-    plt.subplot(1, n, 1)
-    plt.title("Pixel likelihood")
-    plt.imshow(like_im, cmap=inferno)
-    plt.colorbar()
-
-    plt.subplot(1, n, 2)
-    plt.title("Pixel neg log likelihood")
-    plt.imshow(loglike_im, cmap=inferno)
-    plt.colorbar()
-
-    if show_res:
-        seismic.set_bad("k", k)
-        v = np.nanmax(np.abs(res))
-        plt.subplot(1, n, 3)
-        plt.title("Residual")
-        plt.imshow(res, cmap=seismic, vmin=-v, vmax=v)
-        plt.colorbar()
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_vis(holes, model, fim):
-    stds = np.abs(np.diag(-np.linalg.inv(fim))) ** 0.5
-    N = len(model.amplitudes)
+# def plot_vis(holes, model, fim):
+def plot_vis(holes, model, fim=None):
+    if fim is not None:
+        N = len(model.amplitudes)
+        stds = np.abs(np.diag(-np.linalg.inv(fim))) ** 0.5
+        ampl_sig = stds[-2 * N : -N]
+        phase_sig = stds[-N:]
 
     hbls = pairwise_vectors(holes)
     bls_r = np.array(np.hypot(hbls[:, 0], hbls[:, 1]))
     # bls_r = np.concatenate([np.zeros(1), bls_r])  # Add DC term
 
     plt.figure(figsize=(14, 5))
+    plt.suptitle("Visibilities")
 
-    sig = stds[-2 * N : -N]
     plt.subplot(1, 2, 1)
-    plt.title(f"Amplitudes, mean sigma: {sig.mean():.3f}")
-    plt.errorbar(bls_r, model.amplitudes, yerr=sig, fmt="o", capsize=5)
+    if fim is not None:
+        plt.title(f"Amplitudes, mean sigma: {ampl_sig.mean():.3f}")
+        plt.errorbar(bls_r, model.amplitudes, yerr=ampl_sig, fmt="o", capsize=5)
+    else:
+        plt.title("Amplitudes")
+        plt.scatter(bls_r, model.amplitudes)
+    plt.axhline(1, c="k", ls="--")
     plt.ylabel("Amplitudes")
     plt.xlabel("Baseline (m)")
 
-    sig = stds[-N:]
     plt.subplot(1, 2, 2)
-    plt.title(f"Phases, mean sigma: {sig.mean():.3f}")
-    plt.errorbar(bls_r, model.phases, yerr=sig, fmt="o", capsize=5)
+    if fim is not None:
+        plt.title(f"Phases, mean sigma: {phase_sig.mean():.3f}")
+        plt.errorbar(bls_r, model.phases, yerr=phase_sig, fmt="o", capsize=5)
+    else:
+        plt.title("Phases")
+        plt.scatter(bls_r, model.phases)
+    plt.axhline(0, c="k", ls="--")
     plt.ylabel("Phases")
     plt.xlabel("Baseline (m)")
 
@@ -972,3 +1199,61 @@ def show_splodges(model, s=65, pupil_phases=False, k=0.5):
 class Null(dl.layers.unified_layers.UnifiedLayer):
     def apply(self, inputs):
         return inputs
+
+
+from jax import jit, grad, jvp, linearize, lax
+import zodiax as zdx
+
+
+def hvp(f, primals, tangents):
+    return jvp(grad(f), primals, tangents)[1]
+
+
+def hessian(f, x):
+    _, hvp = linearize(grad(f), x)
+    # Jit the sub-function here since it is called many timesc
+    # TODO: Test effect on speed
+    hvp = jit(hvp)
+    basis = np.eye(np.prod(np.array(x.shape))).reshape(-1, *x.shape)
+    return np.stack([hvp(e) for e in basis]).reshape(x.shape + x.shape)
+
+
+def FIM(
+    pytree,
+    parameters,
+    loglike_fn,
+    *loglike_args,
+    shape_dict={},
+    save_ram=True,
+    **loglike_kwargs,
+):
+    # Build X vec
+    pytree = zdx.tree.set_array(pytree, parameters)
+    shapes, lengths = zdx.bayes._shapes_and_lengths(pytree, parameters, shape_dict)
+    X = np.zeros(zdx.bayes._lengths_to_N(lengths))
+
+    # Build function to calculate FIM and calculate
+    # @jax.hessian
+    def calc_fim(X):
+        parametric_pytree = _perturb(X, pytree, parameters, shapes, lengths)
+        return loglike_fn(parametric_pytree, *loglike_args, **loglike_kwargs)
+
+    if save_ram:
+        return hessian(calc_fim, X)
+    return jax.hessian(calc_fim)(X)
+
+
+def _perturb(X, pytree, parameters, shapes, lengths):
+    n, xs = 0, []
+    if isinstance(parameters, str):
+        parameters = [parameters]
+    indexes = range(len(parameters))
+
+    for i, param, shape, length in zip(indexes, parameters, shapes, lengths):
+        if length == 1:
+            xs.append(X[i + n])
+        else:
+            xs.append(lax.dynamic_slice(X, (i + n,), (length,)).reshape(shape))
+            n += length - 1
+
+    return pytree.add(parameters, xs)
